@@ -29,11 +29,12 @@ import os
 import platform
 import sys
 from pathlib import Path
+import math
 
 import torch
 import torch.backends.cudnn as cudnn
 
-FILE = Path(__file__).resolve()
+FILE = Path(__file__).resolve() # creates a Path obj using the __file__ attribute (build-in Python variable). represent file system path. Resolve the path to an abs path
 ROOT = FILE.parents[1]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
@@ -51,7 +52,7 @@ from utils.torch_utils import select_device, smart_inference_mode
 
 @smart_inference_mode()
 def run(
-        weights=ROOT / 'yolov5s-seg.pt',  # model.pt path(s)
+        weights=ROOT / 'yolov5s-seg.pt',  # model.pt path(s) # smart_inference_model() is used as a decorator for the run() function
         source=ROOT / 'data/images',  # file/dir/URL/glob, 0 for webcam
         data=ROOT / 'data/coco128.yaml',  # dataset.yaml path
         imgsz=(640, 640),  # inference size (height, width)
@@ -77,6 +78,8 @@ def run(
         hide_conf=False,  # hide confidences
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
+        toNM=False, # convert to nm or not
+        scale=1, # tthe scale between pixel and nm
 ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -109,7 +112,7 @@ def run(
 
     # Run inference
     model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
-    seen, windows, dt = 0, [], (Profile(), Profile(), Profile())
+    seen, windows, dt = 0, [], (Profile(), Profile(), Profile()) # dt is used to measure the time taken for each part of the code.
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(device)
@@ -149,6 +152,19 @@ def run(
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
             if len(det):
                 masks = process_mask(proto[i], det[:, 6:], det[:, :4], im.shape[2:], upsample=True)  # HWC
+                pixel_count = torch.sum(masks == 1, dim=(1,2))
+                xywh = xyxy2xywh(det[:, :4])
+                x0 = xywh[:, 0:1]
+                y0 = xywh[:, 1:2]
+                x0, _ = torch.cat((x0, im0.shape[1]-x0), 1).min(1, keepdim = True)
+                y0, _ = torch.cat((y0, im0.shape[0]-y0), 1).min(1, keepdim = True)
+                r = torch.sqrt(pixel_count/torch.tensor([math.pi], device = pixel_count.device))
+                incomplete = (torch.cat((x0, y0), 1) < r[:, None]).any(1) # dim = 1
+                det = det[torch.logical_not(incomplete)]
+                # print(f'det.shape = {det.shape}')
+                masks = masks[torch.logical_not(incomplete)]
+                r = r[torch.logical_not(incomplete)]
+
 
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
@@ -165,19 +181,31 @@ def run(
                 # Mask plotting ----------------------------------------------------------------------------------------
 
                 # Write results
+                instance_id = 0
                 for *xyxy, conf, cls in reversed(det[:, :6]):
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                        rplx = r.tolist()[::-1][instance_id]
+                        if save_conf and toNM:
+                           line = (cls, *xywh, conf, instance_id, rplx, rplx/scale) 
+                        elif not save_conf and toNM:
+                           line = (cls, *xywh, instance_id, rplx, rplx/scale) 
+                        elif save_conf and not toNM:
+                            line = (cls, *xywh, conf, instance_id, rplx) 
+                        else:
+                           line = (cls, *xywh, instance_id, rplx) 
+                        # line = (cls, *xywh, conf, instance_id, rplx) if save_conf else (cls, *xywh, instance_id, rplx)  # label format
+                        # print(line)
                         with open(f'{txt_path}.txt', 'a') as f:
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
-                        label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
+                        label = f'{instance_id}' if hide_labels else (f'{names[c]} {instance_id}' if hide_conf else f'{names[c]} {conf:.2f} {instance_id}')
                         annotator.box_label(xyxy, label, color=colors(c, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+                    instance_id += 1
 
             # Stream results
             im0 = annotator.result()
@@ -249,6 +277,8 @@ def parse_opt():
     parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
+    parser.add_argument('--toNM', action='store_true', help='convert from pixel to nm')
+    parser.add_argument('--scale', type=float, default=1, help='the scale between pixel and nm')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
